@@ -1,36 +1,148 @@
+# ABSTRACT: POE::Wheel::Run worker pool
 package POE::Component::WheelRun::Pool;
+
+our $VERSION = 0.1;
 
 use strict;
 use warnings;
 
+use Const::Fast;
 use POE qw(
     Filter::Line
     Filter::Reference
     Wheel::Run
 );
 
+const my @PASS_ARGS => qw(
+    Program ProgramArgs
+    StdoutFilter StderrFilter StdinFilter
+    Priority User Group NoSetSid NoSetPgrp
+);
+
+=head1 SYNOPSIS
+
+Provides a pool wrapper around POE::Wheel::Run to allow for large worker pools that are automatically replenished.
+POE::Component::WheelRun::Pool uses STDIN, STDOUT, and STDERR for communication between the parent session and the worker children.
+
+    my $worker_pool_id = POE::Component::WheelRun::Pool(
+        Alias            => 'pool',             # Default
+        Program          => \&run_analysis,     # Required
+        PoolSize         => 4,                  # Default
+        MaxTasksPerChild => 1000,               # Default '0' = unlimited
+        MaxTimePerChild  => 3600,               # Default '0' = unlimited
+        Splay            => 0.1,                # Default
+        # Any Options from POE::Wheel::Run
+        User     => 'bob',
+        Group    => 'nobody',
+        Priority => 5,
+    );
+
+    my $main = POE::Session->create(inline_states => {
+        new_event => sub { $poe_kernel->post( pool => dispatch => @_[ARG0] ) },
+    });
+
+This will create a pool of 4 workers with the run_analyze function as the entry point to the pool::dispatch event.  Child processes
+should monitor STDIN for availability as the first thing attempted by the parent is an EOF on the STDIN of the child to let it know it should
+go away.  Failing this, a kill() is called which is SIGINT by default.
+
+=cut
+
+=func spawn()
+
+Creates the worker pool and sets it ready for incoming tasks.
+POE::Component::WheelRun::Pool will pass sensible options from POE::Wheel::Run
+to the child process.  See:
+
+    perldoc POE::Wheel::Run
+
+For more information on options not covered here.
+
+=over 8
+
+=item B<Alias>
+
+Default is 'pool', use a unique name to make dispatching events to worker pools easier to understand.
+
+=item B<Program>
+
+Required! Can be either a CODE reference or a path to an executable to launch.  The script needs to be able to accept data on STDIN and communicate
+back to the parent session using STDOUT or STDERR.  This means the program can be in any language.
+
+=item B<PoolSize>
+
+Default is 4.  This is the number of children to spawn and maintain.
+
+=item B<MaxTasksPerChild>
+
+Default 0, anything <= 0 means unlimited.  This is the maximum number of tasks that can be handed to any one worker before it needs to respawn.
+
+=item B<MaxTimePerChild>
+
+Default 0, anything <= 0 means unlimited.  This is the maximum number of seconds any worker can live before being killed and respawned.  This check occurs only inside of the
+dispatch event trigger and only for that "next" worker.   This means it is possible for processes to live longer that B<MaxTimePerChild>, but their next invocation will
+be their last.
+
+=item B<Splay>
+
+Default is 0.1 and is unimportant without B<MaxTimePerChild> or B<MaxTasksPerChild>.  This applies a random splay to the time or tasks checker.  Best thought of as a percentage
+range for max tasks or time.  e. g.
+
+    ChildMaxUpperBound = MaxTasksPerChild + (Splay * MaxTasksPerChild)
+    ChildMaxLowerBound = MaxTasksPerChild - (Splay * MaxTasksPerChild)
+
+When a child is spawned the max tasks/time is calculated inside that range using two calls to rand(), one for the B<Splay> and the second for positive/negative.
+
+The idea behind this is to offset process creation in the parent process as that can be expensive.  If you would like to disable this feature, set the B<Splay> to B<0>.
+
+=item B<StatsInterval>
+
+Default is 60.  Seconds to run the stats handler.
+
+=item B<StatsHandler>
+
+Default 'undef'.  If passed a CODE reference, that refernce is run every B<StatInterval> seconds. The handler is passed a hash reference with the events tracked and the values
+representing the number of times each event ocurred.
+
+=item B<StdoutHandler>
+
+Default 'undef'.  CODE reference with what to do when there's content on STDOUT of the worker process.  Based on B<StdioFilter> or B<StdoutFilter> this reference may be passed
+the content as a stream, line of text, or even a Perl object.
+
+=item B<StderrHandler>
+
+Default 'undef'.  CODE reference with what to do when there's content on STDERR of the worker process.  Based on B<StderrFilter> this reference may be passed
+the content as a stream, line of text, or even a Perl object.
+
+=back
+
+=cut
+
 sub spawn {
     my $type = shift;
 
     # Arguments
     my %args = (
-        Alias         => 'pool',
-        PoolSize      => 4,
-        ProgramArgs   => [],
-        StdinFilter   => POE::Filter::Reference->new(),
-        StdoutFilter  => POE::Filter::Line->new(),
-        StderrFilter  => POE::Filter::Line->new(),
-        WorkerError   => undef,
-        WorkerClose   => undef,
-        WorkerSpawn   => undef,
-        StdoutHandler => undef,
-        StderrHandler => undef,
+        Alias            => 'pool',
+        PoolSize         => 4,
+        MaxTasksPerChild => 0,
+        MaxTimePerChild  => 0,
+        Splay            => 0.1,
+        ProgramArgs      => [],
+        StdinFilter      => POE::Filter::Reference->new(),
+        StdoutFilter     => POE::Filter::Line->new(),
+        StderrFilter     => POE::Filter::Line->new(),
+        WorkerError      => undef,
+        WorkerClose      => undef,
+        WorkerSpawn      => undef,
+        StdoutHandler    => undef,
+        StderrHandler    => undef,
+        StatsHandler     => undef,
         @_
     );
 
     # Validate the Program
     die "Must specify a Program argument as a coderef or path to a script."
-        unless exists %args{Program};
+        unless exists $args{Program};
 
     if(ref $args{Program} ne 'CODE') {
         if(!-x $args{Program}) {
@@ -45,6 +157,7 @@ sub spawn {
             _stop               => \&pool_stop,
             # Interface
             dispatch            => \&pool_dispatch,
+            stats               => \&pool_stats,
             # Worker Management
             worker_spawn        => \&worker_spawn,
             worker_chld         => \&worker_chld,
@@ -54,26 +167,57 @@ sub spawn {
             worker_stderr       => \&worker_stderr,
         },
         heap => {
+            replenish      => 0,
             args           => \%args,
             workers        => 0,
             current_worker => 0,
+            expiry         => {},
+            tasks          => {},
+            stats          => { ticks => 0, },
         }
     );
 }
 
 sub pool_start {
     my ($kernel,$heap) = @_[KERNEL,HEAP];
+    my %args = %{ $heap->{args} };
 
     # Configure our alias
-    $kernel->alias_set($heap->{args}{Alias});
+    $kernel->alias_set($args{Alias});
 
-    for ( 1 .. $heap->{args}{PoolSize} ) {
+    # Configure Some Basics
+    for ( 1 .. $args{PoolSize} ) {
         $kernel->yield('worker_spawn');
     }
+
+    # Check to make sure spawning happened successfully
+    die "Failed starting the right number of workers" unless @{$heap->{workers}} == $args{PoolSize};
+
+    # Enable auto-replenish
+    $heap->{replenish} = 1;
+
+    # Stats engine enabled
+    $kernel->delay_add( stats => $heap->{args}{StatsInterval} );
 }
 
 sub pool_stop {
     my ($kernel,$heap) = @_[KERNEL,HEAP];
+}
+
+sub pool_stats {
+    my ($kernel,$heap) = @_[KERNEL,HEAP];
+
+    my $stats = delete $heap->{stats};
+    if( defined $heap->{args}{StatsHandler} && ref $heap->{args}{StatsHandler} eq 'CODE' ) {
+        eval {
+            $heap->{args}{StatsHandler}->($stats);
+        };
+        if(my $error = $@) {
+            # TODO: DEBUG("ERROR received processing stats: $error");
+        }
+    }
+    $heap->{stats} = { ticks => $stats->{ticks} + 1 };
+    $kernel->delay_add( stats => $heap->{args}{StatsInterval} );
 }
 
 sub pool_dispatch {
@@ -81,7 +225,7 @@ sub pool_dispatch {
     my @args = @_[ARG0..$#_];
     # Count dispatches
     $heap->{stats}{dispatched} ||= 0;
-    $heap->{stats}{dispatched} += $count;
+    $heap->{stats}{dispatched}++;
 
     # Reset processor back to 0
     $heap->{current_worker} = 0 if $heap->{current_worker} >= scalar @{ $heap->{workers} };
@@ -90,22 +234,48 @@ sub pool_dispatch {
     my $wid = $heap->{workers}[$heap->{current_worker}];
     $heap->{_workers}{$wid}->put(@args);
     $heap->{current_worker}++;
+
+    # Check the worker lifespan if necessary
+    my $shutdown_worker = 0;
+    if( exists $heap->{expiry}{$wid} && time >= $heap->{expiry}{$wid} ) {
+        $shutdown_worker = 1;
+    }
+    if( exists $heap->{tasks}{$wid} ) {
+        $heap->{tasks}{$wid}--;
+        if( $heap->{tasks}{$wid} <= 0 ) {
+            $shutdown_worker = 1;
+        }
+    }
+    if( $shutdown_worker == 1 ) {
+        my $worker = _remove_worker($heap,$wid);
+        $worker->shutdown_stdin;
+        $worker->kill;
+        $heap->{stats}{expired} ||= 0;
+        $heap->{stats}{expired}++;
+    }
 }
 
 sub worker_spawn {
     my($kernel,$heap,$dead_id) = @_[KERNEL,HEAP,ARG0];
 
+    if( $dead_id && !$heap->{replenish} ) {
+        # TODO: Error log/exception of some kind
+        return undef;
+    }
+
+    # Pass the relevant options to the POE::Wheel::Run session
+    my %wheel_args = ();
+    foreach my $arg (@PASS_ARGS) {
+        next unless exists $heap->{args}{$arg};
+        $wheel_args{$arg} = $heap->{args}{$arg};
+    }
     # Spawn the worker process
     my $worker = POE::Wheel::Run->new(
-        Program      => $heap->{args}{Program},
-        ProgramArgs  => $heap->{args}{ProgramArgs},
         CloseEvent   => 'worker_close',
         ErrorEvent   => 'worker_error',
         StdoutEvent  => 'worker_stdout',
         StderrEvent  => 'worker_stderr',
-        StdinFilter  => $heap->{args}{StdinFilter},
-        StdoutFilter => $heap->{args}{StdoutFilter},
-        StderrFilter => $heap->{args}{StderrFilter},
+        %wheel_args,
     );
     if(!defined $worker) {
         $kernel->delay_add(worker_spawn => 5);
@@ -119,6 +289,8 @@ sub worker_spawn {
     $heap->{_pid_to_worker}{$worker->PID} = $worker->ID;
     $heap->{workers} = [ sort { $a <=> $b } keys %{ $heap->{_workers} } ];
     $heap->{current_worker} = 0;
+    $heap->{stats}{spawned} ||= 0;
+    $heap->{stats}{spawned}++;
 
     # Assign affinity if we're able to
     my @cpus = ();
@@ -140,6 +312,21 @@ sub worker_spawn {
         # TODO: Log placeholder
     }
 
+    # Establish accounting for tasks/time
+    foreach my $tracker (qw(expiry tasks)) {
+        delete $heap->{$tracker}{$worker->ID} if exists $heap->{$tracker}{$worker->ID};
+    }
+    if( $heap->{args}{MaxTimePerChild} > 0 ) {
+        my $adjuster = $heap->{args}{Splay} > 0 ? int(rand($heap->{args}{Splay}) * $heap->{args}{MaxTimePerChild} * (rand(1) > 0.5 ? -1 : 1))
+                     : 0;
+        $heap->{expiry} = time + $heap->{args}{MaxTimePerChild} + $adjuster;
+    }
+    if( $heap->{args}{MaxTasksPerChild} > 0 ) {
+        my $adjuster = $heap->{args}{Splay} > 0 ? int(rand($heap->{args}{Splay}) * $heap->{args}{MaxTasksPerChild} * (rand(1) > 0.5 ? -1 : 1))
+                     : 0;
+        $heap->{tasks} = $heap->{args}{MaxTasksPerChild} + $adjuster;
+    }
+
     # TODO: Log placeholder
     #INFO("proc_spawn_worker successfully spawned worker:" . $worker->ID . " (cpus:" . join(',', @cpus) . ")");
 }
@@ -149,10 +336,10 @@ sub _remove_worker {
     return unless exists $heap->{_workers}{$wid};
 
     # Remove the Wheel from our HEAP
-    delete $heap->{_workers}{$wid};
+    my $worker = delete $heap->{_workers}{$wid};
     $heap->{workers} = [ sort { $a <=> $b } keys %{ $heap->{_workers} } ];
 
-    return 1;
+    return $worker;
 }
 sub worker_close {
     my ($kernel,$heap,$wid) = @_[KERNEL,HEAP,ARG0];
@@ -170,16 +357,20 @@ sub worker_chld {
     }
     else {
         $wid = exists $heap->{_pid_to_worker}{$pid};
-        _remove_wheel($heap,$wid);
+        _remove_worker($heap,$wid);
         # TODO: INFO("reaped a worker:$wid , scheduling respawn");
     }
-    $kernel->yield( spawn_worker => $wheel_id );
+    $kernel->yield( spawn_worker => $wid );
 }
 sub worker_error {
     my ($kernel, $heap, $op, $code, $wid, $handle) = @_[KERNEL, HEAP, ARG0, ARG1, ARG3, ARG4];
     if ($op eq 'read' and $code == 0 and $handle eq 'STDOUT') {
-        _remove_worker($heap,$wid);
         # TODO: WARN("proc_error: worker_id = $wid closed STDOUT, respawning another worker");
+        my $worker = _remove_worker($heap,$wid);
+        if( defined $worker ) {
+            $worker->shutdown_stdin;
+            $worker->kill;
+        }
     }
 }
 sub worker_stdout {
