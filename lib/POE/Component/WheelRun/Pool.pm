@@ -356,7 +356,7 @@ sub worker_chld {
         # TODO: ERROR("SIGCHLD called on invalid PID:$pid, no reference in lookup table");
     }
     else {
-        $wid = exists $heap->{_pid_to_worker}{$pid};
+        $wid = $heap->{_pid_to_worker}{$pid};
         _remove_worker($heap,$wid);
         # TODO: INFO("reaped a worker:$wid , scheduling respawn");
     }
