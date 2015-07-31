@@ -24,7 +24,7 @@ const my @PASS_ARGS => qw(
 Provides a pool wrapper around POE::Wheel::Run to allow for large worker pools that are automatically replenished.
 POE::Component::WheelRun::Pool uses STDIN, STDOUT, and STDERR for communication between the parent session and the worker children.
 
-    my $worker_pool_id = POE::Component::WheelRun::Pool(
+    my $worker_pool_id = POE::Component::WheelRun::Pool->spawn(
         Alias            => 'pool',             # Default
         Program          => \&run_analysis,     # Required
         PoolSize         => 4,                  # Default
