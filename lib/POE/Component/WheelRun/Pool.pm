@@ -1,12 +1,13 @@
 # ABSTRACT: POE::Wheel::Run worker pool
 package POE::Component::WheelRun::Pool;
 
-our $VERSION = 0.1;
+# VERSION
 
 use strict;
 use warnings;
 
 use Const::Fast;
+use Module::Load;
 use POE qw(
     Filter::Line
     Filter::Reference
@@ -247,11 +248,18 @@ sub pool_dispatch {
         }
     }
     if( $shutdown_worker == 1 ) {
-        my $worker = _remove_worker($heap,$wid);
-        $worker->shutdown_stdin;
-        $worker->kill;
         $heap->{stats}{expired} ||= 0;
         $heap->{stats}{expired}++;
+
+        my $worker = _remove_worker($heap,$wid);
+        if( defined $worker ) {
+            $worker->shutdown_stdin;
+            $worker->kill;
+        }
+        else {
+            $heap->{stats}{expired_dead_worker} ||= 0;
+            $heap->{stats}{expired_dead_worker}++;
+        }
     }
 }
 
@@ -295,7 +303,7 @@ sub worker_spawn {
     # Assign affinity if we're able to
     my @cpus = ();
     eval {
-        require Sys::CpuAffinity;
+        load Sys::CpuAffinity;
 
         $heap->{_max_cpu} ||= Sys::CpuAffinity::getNumCpus() - 1;
         die "no processor count established." unless $heap->{_max_cpu};
@@ -308,9 +316,6 @@ sub worker_spawn {
         }
         Sys::CpuAffinity::setAffinity($worker->PID, \@cpus);
     };
-    if(my $err = $@) {
-        # TODO: Log placeholder
-    }
 
     # Establish accounting for tasks/time
     foreach my $tracker (qw(expiry tasks)) {
@@ -344,62 +349,70 @@ sub _remove_worker {
 sub worker_close {
     my ($kernel,$heap,$wid) = @_[KERNEL,HEAP,ARG0];
 
-    # TODO: Log placeholder
     _remove_worker($heap,$wid);
+    $heap->{stats}{worker_close} ||= 0;
+    $heap->{stats}{worker_close}++;
 }
 sub worker_chld {
     my ($kernel,$heap,$pid,$status) = @_[KERNEL,HEAP,ARG1,ARG2];
 
-    # TODO: INFO("SIGCHLD from PID:$pid, exit status was '$status'");
     my $wid = undef;
     if( ! exists $heap->{_pid_to_worker}{$pid} ) {
-        # TODO: ERROR("SIGCHLD called on invalid PID:$pid, no reference in lookup table");
+        $heap->{stats}{worker_chld_invalid} ||= 0;
+        $heap->{stats}{worker_chld_invalid}++;
     }
     else {
         $wid = $heap->{_pid_to_worker}{$pid};
         _remove_worker($heap,$wid);
-        # TODO: INFO("reaped a worker:$wid , scheduling respawn");
+        $heap->{stats}{worker_chld} ||= 0;
+        $heap->{stats}{worker_chld}++;
     }
     $kernel->yield( spawn_worker => $wid );
 }
 sub worker_error {
     my ($kernel, $heap, $op, $code, $wid, $handle) = @_[KERNEL, HEAP, ARG0, ARG1, ARG3, ARG4];
     if ($op eq 'read' and $code == 0 and $handle eq 'STDOUT') {
-        # TODO: WARN("proc_error: worker_id = $wid closed STDOUT, respawning another worker");
         my $worker = _remove_worker($heap,$wid);
         if( defined $worker ) {
             $worker->shutdown_stdin;
             $worker->kill;
         }
+        $heap->{stats}{worker_error} ||= 0;
+        $heap->{stats}{worker_error}++;
     }
 }
 sub worker_stdout {
     my ($heap,@args) = @_[HEAP,ARG0..$#_];
 
-    # TODO: DEBUG(sprintf "Stdout received:%d args", scalar(@args);
     if( defined $heap->{args}{StdoutHandler} && ref $heap->{args}{StdoutHandler} eq 'CODE' ) {
         eval {
             $heap->{args}{StdoutHandler}->(@args);
         };
         if(my $error = $@) {
-            # TODO: DEBUG("ERROR received processing STDOUT: $error");
+            $heap->{stats}{worker_out_error} ||= 0;
+            $heap->{stats}{worker_out_error}++;
         }
+    }
+    else {
+        $heap->{stats}{worker_out_unhandled} ||= 0;
+        $heap->{stats}{worker_out_unhandled}++;
     }
 }
 sub worker_stderr {
     my ($heap,@args) = @_[HEAP,ARG0..$#_];
 
-    # TODO: DEBUG(sprintf "Stderr received:%d args", scalar(@args);
     if( defined $heap->{args}{StderrHandler} && ref $heap->{args}{StderrHandler} eq 'CODE' ) {
         eval {
             $heap->{args}{StderrHandler}->(@args);
         };
         if(my $error = $@) {
-            # TODO: DEBUG("ERROR received processing STDERR $error");
+            $heap->{stats}{worker_err_error} ||= 0;
+            $heap->{stats}{worker_err_error}++;
         }
     }
     else {
-        # TODO: WARN(sprintf "[UNHANDLED STDERR]:%s". join(',', map { chomp; } @args) );
+        $heap->{stats}{worker_ste_unhandled} ||= 0;
+        $heap->{stats}{worker_ste_unhandled}++;
     }
 }
 
