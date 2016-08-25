@@ -170,7 +170,8 @@ sub spawn {
         heap => {
             replenish      => 0,
             args           => \%args,
-            workers        => 0,
+            workers        => [],
+            _workers       => {},
             current_worker => 0,
             expiry         => {},
             tasks          => {},
@@ -188,7 +189,7 @@ sub pool_start {
 
     # Configure Some Basics
     for ( 1 .. $args{PoolSize} ) {
-        $kernel->yield('worker_spawn');
+        $kernel->call( $args{Alias} => 'worker_spawn');
     }
 
     # Check to make sure spawning happened successfully
@@ -198,7 +199,7 @@ sub pool_start {
     $heap->{replenish} = 1;
 
     # Stats engine enabled
-    $kernel->delay_add( stats => $heap->{args}{StatsInterval} );
+    $kernel->delay_add( stats => $args{StatsInterval} ) if exists $args{StatsInterval};
 }
 
 sub pool_stop {
@@ -367,7 +368,7 @@ sub worker_chld {
         $heap->{stats}{worker_chld} ||= 0;
         $heap->{stats}{worker_chld}++;
     }
-    $kernel->yield( spawn_worker => $wid );
+    $kernel->yield( worker_spawn => $wid );
 }
 sub worker_error {
     my ($kernel, $heap, $op, $code, $wid, $handle) = @_[KERNEL, HEAP, ARG0, ARG1, ARG3, ARG4];
