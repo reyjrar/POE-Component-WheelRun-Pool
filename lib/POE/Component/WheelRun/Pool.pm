@@ -9,14 +9,13 @@ use warnings;
 use Const::Fast;
 use Module::Load;
 use POE qw(
-    Filter::Line
     Filter::Reference
     Wheel::Run
 );
 
 const my @PASS_ARGS => qw(
     Program ProgramArgs
-    StdoutFilter StderrFilter StdinFilter
+    StdioFilter StdinFilter StdoutFilter StderrFilter
     Priority User Group NoSetSid NoSetPgrp
 );
 
@@ -129,9 +128,6 @@ sub spawn {
         MaxTimePerChild  => 0,
         Splay            => 0.1,
         ProgramArgs      => [],
-        StdinFilter      => POE::Filter::Reference->new(),
-        StdoutFilter     => POE::Filter::Line->new(),
-        StderrFilter     => POE::Filter::Line->new(),
         WorkerError      => undef,
         WorkerClose      => undef,
         WorkerSpawn      => undef,
@@ -140,6 +136,10 @@ sub spawn {
         StatsHandler     => undef,
         @_
     );
+
+    unless ( exists $args{StdinFilter} or exists $args{StdoutFilter} ) {
+        $args{StdioFilter} ||= POE::Filter::Reference->new();
+    }
 
     # Validate the Program
     die "Must specify a Program argument as a coderef or path to a script."
@@ -156,6 +156,7 @@ sub spawn {
             # Internal
             _start              => \&pool_start,
             _stop               => \&pool_stop,
+            _child              => \&worker_chld,
             # Interface
             dispatch            => \&pool_dispatch,
             stats               => \&pool_stats,
@@ -172,6 +173,7 @@ sub spawn {
             args           => \%args,
             workers        => [],
             _workers       => {},
+            _workers_pid   => {},
             current_worker => 0,
             expiry         => {},
             tasks          => {},
@@ -295,7 +297,7 @@ sub worker_spawn {
 
     # Track Processors
     $heap->{_workers}{$worker->ID} = $worker;
-    $heap->{_pid_to_worker}{$worker->PID} = $worker->ID;
+    $heap->{_workers_pid}{$worker->PID} = $worker->ID;
     $heap->{workers} = [ sort { $a <=> $b } keys %{ $heap->{_workers} } ];
     $heap->{current_worker} = 0;
     $heap->{stats}{spawned} ||= 0;
@@ -316,6 +318,11 @@ sub worker_spawn {
             $heap->{_cpu}--;
         }
         Sys::CpuAffinity::setAffinity($worker->PID, \@cpus);
+        1;
+    } or do {
+        my $err = $@;
+        $heap->{stats}{cpu_affinity_error} ||= 0;
+        $heap->{stats}{cpu_affinity_error}++;
     };
 
     # Establish accounting for tasks/time
@@ -358,17 +365,18 @@ sub worker_chld {
     my ($kernel,$heap,$pid,$status) = @_[KERNEL,HEAP,ARG1,ARG2];
 
     my $wid = undef;
-    if( ! exists $heap->{_pid_to_worker}{$pid} ) {
+    if( ! exists $heap->{_workers_pid}{$pid} ) {
         $heap->{stats}{worker_chld_invalid} ||= 0;
         $heap->{stats}{worker_chld_invalid}++;
     }
     else {
-        $wid = $heap->{_pid_to_worker}{$pid};
+        $wid = $heap->{_workers_pid}{$pid};
         _remove_worker($heap,$wid);
         $heap->{stats}{worker_chld} ||= 0;
         $heap->{stats}{worker_chld}++;
     }
     $kernel->yield( worker_spawn => $wid );
+    $kernel->sig_handled();
 }
 sub worker_error {
     my ($kernel, $heap, $op, $code, $wid, $handle) = @_[KERNEL, HEAP, ARG0, ARG1, ARG3, ARG4];
@@ -390,6 +398,7 @@ sub worker_stdout {
             $heap->{args}{StdoutHandler}->(@args);
         };
         if(my $error = $@) {
+            warn $error;
             $heap->{stats}{worker_out_error} ||= 0;
             $heap->{stats}{worker_out_error}++;
         }
