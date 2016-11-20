@@ -3,6 +3,7 @@
 .build
 inc
 blib
+Changes
 POE-Component-WheelRun-Pool-*
 MANIFEST
 Makefile
