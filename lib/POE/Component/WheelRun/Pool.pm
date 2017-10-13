@@ -156,7 +156,7 @@ sub spawn {
             # Internal
             _start              => \&pool_start,
             _stop               => \&pool_stop,
-            _child              => \&worker_chld,
+            _child              => \&pool_child,
             # Interface
             dispatch            => \&pool_dispatch,
             stats               => \&pool_stats,
@@ -202,6 +202,15 @@ sub pool_start {
 
     # Stats engine enabled
     $kernel->delay_add( stats => $args{StatsInterval} ) if exists $args{StatsInterval};
+}
+
+sub pool_child {
+    my ($kernel,$heap,$reason,$child) = @_[KERNEL,HEAP,ARG0,ARG1];
+
+    # Record the Child Session Status
+    my $stat = join('_', child => $reason );
+    $heap->{stats}{$stat} ||= 0;
+    $heap->{stats}{$stat}++;
 }
 
 sub pool_stop {
