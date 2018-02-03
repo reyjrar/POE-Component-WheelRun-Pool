@@ -15,7 +15,7 @@ use POE qw(
 
 const my @PASS_ARGS => qw(
     Program ProgramArgs
-    StdioFilter StdinFilter StdoutFilter StderrFilter
+    Filter StdioFilter StdinFilter StdoutFilter StderrFilter
     Priority User Group NoSetSid NoSetPgrp
 );
 
