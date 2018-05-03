@@ -322,7 +322,7 @@ sub worker_spawn {
 
         # Assign Affinity
         for( 1..2 ) {
-            $heap->{_cpu} = $heap->{_max_cpu} if $heap->{_cpu} < 0;
+            $heap->{_cpu} ||= $heap->{_max_cpu};
             push @cpus, $heap->{_cpu};
             $heap->{_cpu}--;
         }
