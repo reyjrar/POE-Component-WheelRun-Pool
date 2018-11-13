@@ -201,7 +201,7 @@ sub pool_start {
     $heap->{replenish} = 1;
 
     # Stats engine enabled
-    $kernel->delay_add( stats => $args{StatsInterval} ) if exists $args{StatsInterval};
+    $kernel->delay( stats => $args{StatsInterval} ) if $args{StatsInterval};
 }
 
 sub pool_child {
@@ -221,16 +221,17 @@ sub pool_stats {
     my ($kernel,$heap) = @_[KERNEL,HEAP];
 
     my $stats = delete $heap->{stats};
-    if( defined $heap->{args}{StatsHandler} && ref $heap->{args}{StatsHandler} eq 'CODE' ) {
+    if( $heap->{args}{StatsHandler} && ref $heap->{args}{StatsHandler} eq 'CODE' ) {
         eval {
             $heap->{args}{StatsHandler}->($stats);
+            1;
+        } or do {
+            my $error = $@;
+            warn "StatsHandler threw error: $error";
         };
-        if(my $error = $@) {
-            # TODO: DEBUG("ERROR received processing stats: $error");
-        }
     }
     $heap->{stats} = { ticks => $stats->{ticks} + 1 };
-    $kernel->delay_add( stats => $heap->{args}{StatsInterval} );
+    $kernel->delay( stats => $heap->{args}{StatsInterval} );
 }
 
 sub pool_dispatch {
